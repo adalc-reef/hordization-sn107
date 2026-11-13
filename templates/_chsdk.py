@@ -1,10 +1,12 @@
-"""Translate Minos's Docker argv and round lifecycle to the optional ComputeHorde SDK"""
+"""Run local payloads alongside a best-effort remote ComputeHorde hello-world job."""
 
+import argparse
 import asyncio
 import codecs
 import io
 import locale
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -25,6 +27,89 @@ from compute_horde_sdk.v1.local import (
 from . import _common
 
 logger = logging.getLogger(__name__)
+
+
+def _remote_keys():
+    """Use the validator's wallet options without changing its configuration code."""
+    from bittensor_wallet import Wallet
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    parser.add_argument("--wallet.name", dest="name", default="default")
+    parser.add_argument("--wallet.hotkey", dest="hotkey", default="default")
+    parser.add_argument("--wallet.path", dest="path", default="~/.bittensor/wallets")
+    options, _ = parser.parse_known_args()
+    signing_key = Wallet(
+        name=os.getenv("WALLET_NAME") or options.name,
+        hotkey=os.getenv("WALLET_HOTKEY") or options.hotkey,
+        path=options.path,
+    ).hotkey
+    target = os.getenv("CHSDK_VALIDATOR_HOTKEY")
+    if not target:
+        target = Wallet(name="compute_horde_validator", hotkey="default").hotkey.ss58_address
+    return signing_key, target
+
+
+async def _remote_hello_world(name, deadline):
+    """Bound submission and polling; remote failures must never replace local results."""
+    client = None
+    job = None
+
+    async def submit_and_wait():
+        nonlocal client, job
+        from compute_horde_sdk.v1 import ComputeHordeClient, ComputeHordeJobSpec, ExecutorClass
+
+        signing_key, target = await asyncio.to_thread(_remote_keys)
+        client = ComputeHordeClient(
+            hotkey=signing_key,
+            compute_horde_validator_hotkey=target,
+            facilitator_url="https://facilitator.computehorde.io/",
+        )
+        logger.info("CHSDK remote hello-world for %s: submitting to validator %s", name, target)
+        job = await client.create_job(ComputeHordeJobSpec(
+            executor_class=ExecutorClass.always_on__cpu__8c__16gb,
+            job_namespace="SN107.0",
+            docker_image="hello-world:latest",
+            artifacts_dir="",
+            download_time_limit_sec=30,
+            execution_time_limit_sec=10,
+            upload_time_limit_sec=10,
+        ))
+        logger.info("CHSDK remote hello-world for %s: job %s submitted", name, job.uuid)
+
+        async def show_status(remote_job, entry):
+            logger.info("CHSDK remote hello-world for %s: job %s status %s",
+                        name, remote_job.uuid, entry.status.value)
+
+        await job.wait(status_callback=show_status)
+        if job.result is not None:
+            logger.info("CHSDK remote hello-world for %s: job %s stdout=%r stderr=%r",
+                        name, job.uuid, job.result.stdout, job.result.stderr)
+        if job.status.is_successful():
+            logger.info("CHSDK remote hello-world for %s: job %s succeeded", name, job.uuid)
+        else:
+            logger.warning("CHSDK remote hello-world for %s: job %s failed: %s",
+                           name, job.uuid, job.error or job.status)
+
+    remaining = _common._remaining(deadline)
+    budget = 300 if remaining is None else min(300, remaining)
+    logger.info("CHSDK remote hello-world for %s: starting alongside local job (budget %.1fs)",
+                name, budget)
+    try:
+        await asyncio.wait_for(submit_and_wait(), timeout=budget)
+    except asyncio.TimeoutError:
+        logger.warning("CHSDK remote hello-world for %s: timed out after %.1fs (job %s); "
+                       "local result is unaffected", name, budget, job.uuid if job else "UUID unavailable")
+    except Exception:
+        logger.warning("CHSDK remote hello-world for %s failed; local result is unaffected",
+                       name, exc_info=True)
+    finally:
+        if client is not None:
+            try:
+                # SDK 0.0.20 has no public close method.
+                await asyncio.wait_for(client._client.aclose(), timeout=5)
+            except Exception:
+                logger.warning("CHSDK remote hello-world for %s: could not close client",
+                               name, exc_info=True)
 
 
 def parse_command(cmd: list[str]) -> LocalDockerJobSpec:
@@ -158,6 +243,7 @@ class _Runner:
             self.jobs[name] = job
             _common._live_containers.add(name)
             job.start()
+        remote = asyncio.create_task(_remote_hello_world(name, deadline))
         cleanup_confirmed = True
         try:
             try:
@@ -177,6 +263,9 @@ class _Runner:
                 _common._live_containers.discard(name)
                 if cleanup_confirmed and self.jobs.get(name) is job:
                     del self.jobs[name]
+            # Join even if the local job failed. The stub handles its own errors,
+            # preserving the local result/exception and keeping its output separate.
+            await remote
 
     async def stop(self, name: str, job: LocalDockerJob, deadline: float) -> bool:
         try:
