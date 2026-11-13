@@ -28,6 +28,8 @@ from . import _common
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHSDK_VALIDATOR_HOTKEY = "5Hjbf5s2Cb4xuYGLKUGVEkwQrMpSMYvnatJxVenMnjodtEKi"
+
 
 def _remote_keys():
     """Use the validator's wallet options without changing its configuration code."""
@@ -43,9 +45,7 @@ def _remote_keys():
         hotkey=os.getenv("WALLET_HOTKEY") or options.hotkey,
         path=options.path,
     ).hotkey
-    target = os.getenv("CHSDK_VALIDATOR_HOTKEY")
-    if not target:
-        target = Wallet(name="compute_horde_validator", hotkey="default").hotkey.ss58_address
+    target = os.getenv("CHSDK_VALIDATOR_HOTKEY") or DEFAULT_CHSDK_VALIDATOR_HOTKEY
     return signing_key, target
 
 

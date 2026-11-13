@@ -26,8 +26,9 @@ Requests are signed using the validator's `WALLET_NAME` / `WALLET_HOTKEY`
 environment settings, falling back to `--wallet.name` / `--wallet.hotkey`
 (both default to `default`). `--wallet.path` is also honored. Set
 `CHSDK_VALIDATOR_HOTKEY` to the target Compute Horde validator's SS58 address;
-if unset, the address is read from the local `compute_horde_validator/default`
-wallet, as in the hello-world script. No additional wallet package pin is needed.
+if unset or empty, it defaults to
+`5Hjbf5s2Cb4xuYGLKUGVEkwQrMpSMYvnatJxVenMnjodtEKi`.
+No target validator wallet is needed. No additional wallet package pin is needed.
 
 ## Installation
 
