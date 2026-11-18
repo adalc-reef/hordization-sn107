@@ -66,7 +66,7 @@ async def _remote_hello_world(name, deadline):
         )
         logger.info("CHSDK remote hello-world for %s: submitting to validator %s", name, target)
         job = await client.create_job(ComputeHordeJobSpec(
-            executor_class=ExecutorClass.always_on__cpu__8c__16gb,
+            executor_class=ExecutorClass.always_on__cpu__4c__8gb,
             job_namespace="SN107.0",
             docker_image="hello-world:latest",
             artifacts_dir="",

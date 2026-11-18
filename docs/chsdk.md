@@ -17,7 +17,7 @@ remote HTTP client has a separate five-second limit. A polling timeout does not
 cancel the already submitted remote job.
 
 The remote job uses namespace `SN107.0` and executor class
-`always_on.cpu.8c.16gb`, with download/execution/upload limits of 30/10/10 seconds.
+`always_on.cpu.4c.8gb`, with download/execution/upload limits of 30/10/10 seconds.
 Submission, job UUID, status changes, output, and completion are logged through
 `templates._chsdk` (INFO for progress, WARNING for failures). Remote output is
 kept out of the local payload's stdout/stderr and output files.
