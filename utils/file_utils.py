@@ -4,7 +4,7 @@ import os
 import hashlib
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -312,6 +312,7 @@ def download_file_with_fallback(
     backup_url: Optional[str] = None,
     expected_sha256: Optional[str] = None,
     show_progress: bool = True,
+    on_source: Optional[Callable[[Path, Optional[str]], None]] = None,
 ) -> Optional[Path]:
     """Download file trying primary_url first, then backup_url on failure.
 
@@ -333,12 +334,18 @@ def download_file_with_fallback(
     # With a backup available, a digest mismatch on the primary defers rather
     # than returning immediately, so the backup gets a chance to supply
     # matching bytes. With no backup configured there is nothing to defer to.
+    # A verified cache hit has no observed source URL. Track actual transfers,
+    # including a deferred primary restored after its backup failed.
+    fresh = []
     result = download_file_verified(
         primary_url, local_path, expected_sha256=expected_sha256,
         show_progress=show_progress,
+        on_download=fresh.append,
         on_mismatch="defer" if backup_url else "accept",
     )
     if result:
+        if on_source:
+            on_source(local_path, primary_url if fresh else None)
         return result
 
     if backup_url:
@@ -355,11 +362,14 @@ def download_file_with_fallback(
                 local_path.unlink(missing_ok=True)
                 quarantined = None
 
+        backup_fresh = []
         backup_result = download_file_verified(
             backup_url, local_path, expected_sha256=expected_sha256,
-            show_progress=show_progress,
+            show_progress=show_progress, on_download=backup_fresh.append,
         )
         if backup_result:
+            if on_source:
+                on_source(local_path, backup_url if backup_fresh else None)
             if quarantined:
                 quarantined.unlink(missing_ok=True)
             return backup_result
@@ -371,6 +381,8 @@ def download_file_with_fallback(
             )
             try:
                 quarantined.replace(local_path)
+                if on_source:
+                    on_source(local_path, primary_url if fresh else None)
                 return local_path
             except OSError:
                 quarantined.unlink(missing_ok=True)
@@ -412,6 +424,7 @@ def download_file_verified(
     expected_sha256: Optional[str] = None,
     show_progress: bool = True,
     on_mismatch: str = "accept",
+    on_download: Optional[Callable[[Path], None]] = None,
 ) -> Optional[Path]:
     """Download file with SHA256 verification for caching.
 
@@ -453,6 +466,9 @@ def download_file_verified(
     result = download_file(url, local_path, use_cache=False, show_progress=show_progress)
     if result is None:
         return None
+
+    if on_download:
+        on_download(result)
 
     # Verify the freshly downloaded bytes too, not just the cache branch.
     expected = _normalised_digest(expected_sha256)

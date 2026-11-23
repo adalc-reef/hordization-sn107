@@ -1,49 +1,66 @@
-# ComputeHorde SDK runner
+# Compute Horde GATK comparison
 
-Minos defaults to `CONTAINER_RUNNER=native`. To opt in,
-install the CHSDK below, then set this single setting in the validator's `.env`:
-
-```dotenv
-CONTAINER_RUNNER=chsdk
-```
-
-Each container invocation runs the real SN107 payload through the SDK's local
-Docker runner and concurrently submits `hello-world:latest` to Compute Horde
-(SN12) through `https://facilitator.computehorde.io/`. Both are awaited before
-returning the local result (or raising the local error). Remote failures are
-logged and do not fail the local job. Remote submission and polling are limited
-to 300 seconds, capped by the local invocation's remaining timeout; closing the
-remote HTTP client has a separate five-second limit. A polling timeout does not
-cancel the already submitted remote job.
-
-The remote job uses namespace `SN107.0` and executor class
-`always_on.cpu.4c.8gb`, with download/execution/upload limits of 30/10/10 seconds.
-Submission, job UUID, status changes, output, and completion are logged through
-`templates._chsdk` (INFO for progress, WARNING for failures). Remote output is
-kept out of the local payload's stdout/stderr and output files.
-
-Requests are signed using the validator's `WALLET_NAME` / `WALLET_HOTKEY`
-environment settings, falling back to `--wallet.name` / `--wallet.hotkey`
-(both default to `default`). `--wallet.path` is also honored. Set
-`CHSDK_VALIDATOR_HOTKEY` to the target Compute Horde validator's SS58 address;
-if unset or empty, it defaults to
-`5Hjbf5s2Cb4xuYGLKUGVEkwQrMpSMYvnatJxVenMnjodtEKi`.
-No target validator wallet is needed. No additional wallet package pin is needed.
-
-## Installation
-
-Install `compute-horde-sdk` from PyPI together with the Minos stack.
+Minos defaults to the native container runner. To enable comparison, install
+the optional runner and configure the validator's environment.
 
 ```bash
 python -m pip install -r requirements-chsdk.txt
-python -m pip check
 ```
 
-## Testing
+```dotenv
+CONTAINER_RUNNER=chsdk
+CHSDK_S3_BUCKET=<private bucket>
+CHSDK_S3_ACCESS_KEY_ID=<access key>
+CHSDK_S3_SECRET_ACCESS_KEY=<secret key>
+```
 
-Install `requirements-dev.txt` into the selected environment, then run:
+The validator uses these explicit credentials for GetObject, PutObject and
+DeleteObject under `chsdk/` and discovers the bucket region with HeadBucket.
+The worker gets time-limited URLs for integration-owned objects.
+
+Each scoring-round GATK HaplotypeCaller starts through the SDK's local Docker
+runner. A concurrent Compute Horde job uses the same image and caller arguments.
+Other callers, helper containers and hap.py run locally. Minos scores the local
+VCF and preserves the local runner's result or exception.
+
+The worker receives five files. The BAM and downloaded BAI use their accepted
+platform URLs. A BAI built during preparation is uploaded once per round.
+The FASTA, FAI and dictionary use the chromosome's installer inventory. A
+cache populated before this preparation has unknown download provenance, and
+a legacy or custom reference outside the standard inventory is unavailable
+for comparison.
+
+The job uses namespace `SN107.0` and executor class `always_on.cpu.4c.8gb`.
+The caller timeout and assigned submit window bound the comparison. Without an
+assignment, the caller timeout applies. At submission, about 20% of the remaining
+seconds are allocated to input download, 10% to upload, and the balance to execution.
+
+Requests are signed using the validator's `WALLET_NAME` and `WALLET_HOTKEY`,
+falling back to `--wallet.name` and `--wallet.hotkey` (both default to
+`default`). The runner also honors `--wallet.path`. The target validator
+defaults to `5Hjbf5s2Cb4xuYGLKUGVEkwQrMpSMYvnatJxVenMnjodtEKi` and
+can be selected with the existing `CHSDK_VALIDATOR_HOTKEY`.
+
+Each attempt signs a distinct PUT for the VCF and its TBI. The validator
+deletes each output immediately after retrieval. Round finalization retires
+the shared index after outstanding uploads and any still-valid GET issued to
+an ambiguously submitted job. The v1 remote SDK has no job cancellation API.
+After an ambiguous submission or interrupted wait, Minos schedules another deletion
+after the signed PUT expiry and upload window. These cleanups run in memory.
+An S3 lifecycle expiration on the integration prefix can cover validator
+process loss or persistent deletion failures.
+
+The check compares the VCF column header and all decompressed record lines in order.
+It also streams each VCF through its own tabix index and verifies that indexed
+retrieval reproduces the sequential read.
+
+## Verification
 
 ```bash
 python -m pytest
-MINOS_CHSDK_DOCKER_TESTS=1 python -m pytest tests/test_chsdk_docker.py
+MINOS_CHSDK_DOCKER_TESTS=1 python -m pytest tests/test_chsdk_docker.py tests/test_chsdk_gatk_docker.py
 ```
+
+The GATK Docker test uses the real SDK serializer, input downloader and output
+uploader, two GATK containers, and a loopback S3 emulator. It needs `moto_server` on PATH
+(from the `moto[server]` test package).

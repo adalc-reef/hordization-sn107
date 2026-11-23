@@ -17,7 +17,7 @@ def test_native_hooks_without_chsdk(setting):
 
         original = builtins.__import__
         def blocked(name, *args, **kwargs):
-            if name.startswith("compute_horde_sdk") or name.endswith("_chsdk"):
+            if name.startswith(("compute_horde_sdk", "boto3", "botocore")) or name.endswith("_chsdk"):
                 raise AssertionError("native mode imported the CHSDK")
             return original(name, *args, **kwargs)
         builtins.__import__ = blocked

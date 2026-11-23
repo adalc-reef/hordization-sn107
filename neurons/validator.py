@@ -57,7 +57,7 @@ from utils.subset_scoring import (
 )
 from utils import scoring_version as scoring_version_util
 from templates import DEPRECATED_TEMPLATES, load_template
-from templates._common import begin_round, reap_live_containers
+from templates._common import _chsdk_runner, begin_round, reap_live_containers
 from templates.tool_params import validate_round_id
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -762,7 +762,9 @@ class Validator:
             # Round files may not be ready at round start. Retry rather than skip
             # the round, re-pulling round data each attempt so repaired files and
             # fresh presigned URLs are picked up.
-            download_result = self._download_round_files(round_id, round_data)
+            runner = _chsdk_runner()
+            comparison = runner.ComparisonRound(round_id, BASE_DIR) if runner else None
+            download_result = self._download_round_files(round_id, round_data, comparison)
             _dl_attempt = 1
             while download_result is None and _dl_attempt < 10:
                 # Give up while enough of the window remains to score the next
@@ -790,7 +792,7 @@ class Validator:
                     self._adopt_round_pin(round_id, round_data.get("scoring_version"))
                 except Exception as e:
                     bt.logging.warning(f"Round {round_id}: round-data refresh failed ({e}); reusing previous")
-                download_result = self._download_round_files(round_id, round_data)
+                download_result = self._download_round_files(round_id, round_data, comparison)
             if download_result is None:
                 bt.logging.error(f"Round {round_id}: files still not ready after 10 attempts — skipping round")
                 return False
@@ -915,9 +917,7 @@ class Validator:
                     return  # fallback mode: no assignment, so no window to enforce
                 while not scoring_window_closed(scoring_deadline, grace_seconds):
                     await asyncio.sleep(5)
-                reaped = await asyncio.get_running_loop().run_in_executor(
-                    None, reap_live_containers
-                )
+                reaped = await asyncio.to_thread(reap_live_containers)
                 if reaped:
                     bt.logging.warning(
                         f"Round {round_id}: reaped {reaped} variant-calling "
@@ -1024,6 +1024,10 @@ class Validator:
             # from an earlier round cannot start a container in this one.
             # Before the reaper and before any job, in both modes.
             begin_round()
+            if comparison:
+                remaining = (None if scoring_deadline is None else
+                             seconds_until_deadline(scoring_deadline) + grace_seconds)
+                runner.bind_round(comparison, ref_path, round_data.get("region", ""), remaining)
             reaper = asyncio.create_task(_reap_past_the_window())
             try:
                 if scoring_deadline is None:
@@ -1038,9 +1042,7 @@ class Validator:
                         # job's worker thread keeps going until its container
                         # exits -- so reap here as well as in the watchdog,
                         # which may not have woken yet.
-                        reaped = await asyncio.get_running_loop().run_in_executor(
-                            None, reap_live_containers
-                        )
+                        reaped = await asyncio.to_thread(reap_live_containers)
                         bt.logging.warning(
                             f"Round {round_id}: scoring stopped at the submit "
                             f"window with work still running; reaped {reaped} "
@@ -1048,6 +1050,8 @@ class Validator:
                         )
             finally:
                 reaper.cancel()
+                if comparison:
+                    await asyncio.to_thread(runner.finish_round, comparison)
 
             # --- Steps 5 & 6: Backfill + finalize ---
             finalized = await self._finalize_round_scores(
@@ -1087,7 +1091,7 @@ class Validator:
             snapshot.get("recorded_round_ids", set())
         )
 
-    def _download_round_files(self, round_id, round_data):
+    def _download_round_files(self, round_id, round_data, comparison=None):
         """Download BAM + truth VCF and verify reference files; return paths dict or None on failure."""
         # Resolve primary/backup URL order based on operator preference
         _prefer_hippius = os.getenv("STORAGE_PRIMARY_BACKEND", "hippius").lower() != "aws_s3"
@@ -1127,8 +1131,11 @@ class Validator:
         bam_sha256 = round_data.get("bam_sha256")
         truth_vcf_sha256 = round_data.get("truth_vcf_sha256")
 
+        source = {"on_source": comparison.record_source} if comparison else {}
+        if comparison:
+            comparison.refresh_sources(bam_url, bam_url_backup)
         print(f"   Downloading BAM...", flush=True)
-        if not download_file_with_fallback(bam_url, bam_path, backup_url=bam_url_backup, expected_sha256=bam_sha256, show_progress=True):
+        if not download_file_with_fallback(bam_url, bam_path, backup_url=bam_url_backup, expected_sha256=bam_sha256, show_progress=True, **source):
             bt.logging.error(f"Round {round_id}: failed to download BAM (primary and backup)")
             return None
 
@@ -1137,7 +1144,7 @@ class Validator:
             bam_index_path.unlink()
         if bam_index_url or bam_index_url_backup:
             print(f"   Downloading BAM index...", flush=True)
-            if not download_file_with_fallback(bam_index_url, bam_index_path, backup_url=bam_index_url_backup, show_progress=False):
+            if not download_file_with_fallback(bam_index_url, bam_index_path, backup_url=bam_index_url_backup, show_progress=False, **source):
                 bt.logging.warning(f"Round {round_id}: failed to download BAM index; will build it locally")
 
         # Build the index locally when none was provided or the download failed;
@@ -1147,6 +1154,8 @@ class Validator:
             try:
                 import pysam
                 pysam.index(str(bam_path))  # writes round.bam.bai next to the BAM
+                if comparison:
+                    comparison.built_index = True
             except Exception as e:
                 bt.logging.warning(f"Round {round_id}: BAM index build failed (continuing): {e}")
 

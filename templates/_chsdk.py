@@ -1,4 +1,4 @@
-"""Run local payloads alongside a best-effort remote ComputeHorde hello-world job."""
+"""Local Compute Horde runner with a round-scoped GATK comparison."""
 
 import argparse
 import asyncio
@@ -24,7 +24,8 @@ from compute_horde_sdk.v1.local import (
     LocalJobTimeoutError,
 )
 
-from . import _common
+from . import _common, _chsdk_compare
+from ._chsdk_compare import ComparisonRound
 
 logger = logging.getLogger(__name__)
 
@@ -47,69 +48,6 @@ def _remote_keys():
     ).hotkey
     target = os.getenv("CHSDK_VALIDATOR_HOTKEY") or DEFAULT_CHSDK_VALIDATOR_HOTKEY
     return signing_key, target
-
-
-async def _remote_hello_world(name, deadline):
-    """Bound submission and polling; remote failures must never replace local results."""
-    client = None
-    job = None
-
-    async def submit_and_wait():
-        nonlocal client, job
-        from compute_horde_sdk.v1 import ComputeHordeClient, ComputeHordeJobSpec, ExecutorClass
-
-        signing_key, target = await asyncio.to_thread(_remote_keys)
-        client = ComputeHordeClient(
-            hotkey=signing_key,
-            compute_horde_validator_hotkey=target,
-            facilitator_url="https://facilitator.computehorde.io/",
-        )
-        logger.info("CHSDK remote hello-world for %s: submitting to validator %s", name, target)
-        job = await client.create_job(ComputeHordeJobSpec(
-            executor_class=ExecutorClass.always_on__cpu__4c__8gb,
-            job_namespace="SN107.0",
-            docker_image="hello-world:latest",
-            artifacts_dir="",
-            download_time_limit_sec=30,
-            execution_time_limit_sec=10,
-            upload_time_limit_sec=10,
-        ))
-        logger.info("CHSDK remote hello-world for %s: job %s submitted", name, job.uuid)
-
-        async def show_status(remote_job, entry):
-            logger.info("CHSDK remote hello-world for %s: job %s status %s",
-                        name, remote_job.uuid, entry.status.value)
-
-        await job.wait(status_callback=show_status)
-        if job.result is not None:
-            logger.info("CHSDK remote hello-world for %s: job %s stdout=%r stderr=%r",
-                        name, job.uuid, job.result.stdout, job.result.stderr)
-        if job.status.is_successful():
-            logger.info("CHSDK remote hello-world for %s: job %s succeeded", name, job.uuid)
-        else:
-            logger.warning("CHSDK remote hello-world for %s: job %s failed: %s",
-                           name, job.uuid, job.error or job.status)
-
-    remaining = _common._remaining(deadline)
-    budget = 300 if remaining is None else min(300, remaining)
-    logger.info("CHSDK remote hello-world for %s: starting alongside local job (budget %.1fs)",
-                name, budget)
-    try:
-        await asyncio.wait_for(submit_and_wait(), timeout=budget)
-    except asyncio.TimeoutError:
-        logger.warning("CHSDK remote hello-world for %s: timed out after %.1fs (job %s); "
-                       "local result is unaffected", name, budget, job.uuid if job else "UUID unavailable")
-    except Exception:
-        logger.warning("CHSDK remote hello-world for %s failed; local result is unaffected",
-                       name, exc_info=True)
-    finally:
-        if client is not None:
-            try:
-                # SDK 0.0.20 has no public close method.
-                await asyncio.wait_for(client._client.aclose(), timeout=5)
-            except Exception:
-                logger.warning("CHSDK remote hello-world for %s: could not close client",
-                               name, exc_info=True)
 
 
 def parse_command(cmd: list[str]) -> LocalDockerJobSpec:
@@ -223,6 +161,7 @@ class _Runner:
     def __init__(self):
         self.client = LocalDockerClient(cleanup_timeout=30)
         self.jobs: dict[str, LocalDockerJob] = {}
+        self.rounds: dict[int, ComparisonRound] = {}
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, name="minos-chsdk", daemon=True)
         self.thread.start()
@@ -231,6 +170,62 @@ class _Runner:
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
 
     async def run(self, cmd, spec, output, round_id, deadline, timeout, check):
+        is_gatk = (spec.docker_image.startswith("broadinstitute/gatk:")
+                   and spec.args[:2] == ("gatk", "--java-options") and spec.args[3:4] == ("HaplotypeCaller",))
+        if not is_gatk:
+            return await self.run_local(cmd, spec, output, round_id, deadline, timeout, check)
+
+        started = time.monotonic()
+        with _common._live_lock:
+            ctx = self.rounds.get(round_id) if round_id == _common._open_round else None
+        deadlines = [d for d in (deadline, ctx.deadline if ctx else None) if d is not None]
+        remote_deadline = min(deadlines, default=None)
+        miner = "unknown"
+        if "-O" in spec.args[:-1]:
+            filename = spec.args[spec.args.index("-O") + 1].rsplit("/", 1)[-1]
+            miner = filename.removeprefix("miner_").removesuffix(".vcf.gz")
+        round_label = ctx.round_id if ctx else round_id
+        logger.info("CHSDK remote GATK starting comparison round=%s miner=%s attempt=%s",
+                    round_label, miner, spec.container_name)
+        remote = asyncio.create_task(_chsdk_compare.run_remote(ctx, spec, remote_deadline, _remote_keys))
+        if ctx:
+            ctx.users.add(remote)
+            remote.add_done_callback(ctx.users.discard)
+        local_status = "failed"
+        try:
+            local = await self.run_local(cmd, spec, output, round_id, deadline, timeout, check)
+            local_status = "ok" if local.returncode == 0 else f"exit {local.returncode}"
+            return local
+        except Exception as exc:
+            local_status = type(exc).__name__
+            raise
+        finally:
+            local_elapsed = time.monotonic() - started
+            remote_status = "round closed"
+            remote_elapsed = 0.0
+            outcome = "unavailable"
+            reason = ""
+            try:
+                result, remote_status, remote_elapsed = await remote
+                if remote_status != "ok":
+                    reason = remote_status
+                elif local_status != "ok":
+                    result[0].cleanup()
+                    reason = "local caller failed"
+                else:
+                    outcome = await asyncio.wait_for(asyncio.to_thread(_chsdk_compare.compare, *result,
+                                                                       remote_deadline),
+                                                     _common._remaining(remote_deadline))
+                    reason = ("VCF columns or records differ" if outcome == "mismatch" else
+                              "indexed VCF columns and records agree")
+            except (asyncio.CancelledError, Exception) as exc:
+                reason = str(exc) if isinstance(exc, _chsdk_compare.Unavailable) else type(exc).__name__
+            logger.info("GATK comparison round=%s miner=%s attempt=%s local=%s local_seconds=%.3f "
+                        "remote=%s remote_seconds=%.3f result=%s reason=%s",
+                        round_label, miner, spec.container_name, local_status, local_elapsed,
+                        remote_status, remote_elapsed, outcome, reason)
+
+    async def run_local(self, cmd, spec, output, round_id, deadline, timeout, check):
         name = spec.container_name
         with _common._live_lock:
             if round_id is not None and _common._open_round != round_id:
@@ -243,7 +238,6 @@ class _Runner:
             self.jobs[name] = job
             _common._live_containers.add(name)
             job.start()
-        remote = asyncio.create_task(_remote_hello_world(name, deadline))
         cleanup_confirmed = True
         try:
             try:
@@ -263,9 +257,6 @@ class _Runner:
                 _common._live_containers.discard(name)
                 if cleanup_confirmed and self.jobs.get(name) is job:
                     del self.jobs[name]
-            # Join even if the local job failed. The stub handles its own errors,
-            # preserving the local result/exception and keeping its output separate.
-            await remote
 
     async def stop(self, name: str, job: LocalDockerJob, deadline: float) -> bool:
         try:
@@ -287,17 +278,24 @@ class _Runner:
         if job is not None and await self.stop(name, job, deadline):
             logger.warning("Reaped orphaned CHSDK container %s", name)
 
-    async def reap_all(self, deadline):
+    async def reap_all(self, deadline, generation=None):
         with _common._live_lock:
+            if generation is not None and _common._open_round not in (None, generation):
+                # A watchdog queued on the validator's executor can arrive late.
+                return 0
+            ctx = self.rounds.pop(_common._open_round, None)
             _common._open_round = None
             _common._live_containers.clear()
             # Include unconfirmed removals from earlier cleanup attempts.
             snapshot = list(self.jobs.items())
             for _, job in snapshot:
                 job.request_stop()
+        cleanup = ctx.close() if ctx else None
         removed = sum(await asyncio.gather(
             *(self.stop(name, job, deadline) for name, job in snapshot)
         ))
+        if cleanup:
+            await asyncio.wait([cleanup], timeout=_common._remaining(deadline))
         if removed:
             logger.warning("Reaped %d CHSDK container job(s)", removed)
         return removed
@@ -313,6 +311,28 @@ def _get_runner() -> _Runner:
         if _runner is None:
             _runner = _Runner()
         return _runner
+
+
+def bind_round(ctx, reference, region, remaining):
+    runner = _get_runner()
+    generation = _common._job_round.get()
+    ctx.bind(generation, reference, region, remaining)
+    with _common._live_lock:
+        if generation == _common._open_round:
+            runner.rounds[generation] = ctx
+
+
+def finish_round(ctx):
+    runner = _get_runner()
+
+    async def finish():
+        with _common._live_lock:
+            runner.rounds.pop(ctx.generation, None)
+            if _common._open_round == ctx.generation:
+                _common._open_round = None
+        await asyncio.wait([ctx.close()], timeout=_common.REAP_BUDGET_SECONDS)
+
+    runner.call(finish())
 
 
 def run_container(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -342,4 +362,4 @@ def reap_container(name: str) -> None:
 def reap_live_containers(budget_seconds: float = 20) -> int:
     deadline = time.monotonic() + budget_seconds
     runner = _get_runner()
-    return runner.call(runner.reap_all(deadline))
+    return runner.call(runner.reap_all(deadline, _common._job_round.get()))
