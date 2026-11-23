@@ -122,6 +122,13 @@ def test_pair_with_http_volumes(tmp_path, monkeypatch, caplog, endpoint, scoring
         }
         for volume in volumes:
             assert volume["volume_type"] == "single_file"
+            path = Path(volume["relative_path"])
+            if path.parent == Path("data"):
+                assert volume["cache_key"] == f"output/scoring/{safe_round_dir_name(round_id)}/{path.name}"
+                assert volume["cache_ttl_seconds"] == 7200
+            else:
+                assert volume["cache_key"] == f"datasets/reference/chr20/{path.name}"
+                assert volume["cache_ttl_seconds"] == 604800
             downloader = VolumeDownloader.for_volume(SingleFileVolume.model_validate(volume))
             await downloader.download(worker / "volume")
         args = body["args"]

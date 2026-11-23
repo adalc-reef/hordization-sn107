@@ -30,6 +30,20 @@ cache populated before this preparation has unknown download provenance, and
 a legacy or custom reference outside the standard inventory is unavailable
 for comparison.
 
+The executor cache uses the validator's project-relative file paths as keys.
+The BAM and BAI share the validator's round directory, where `<hash>` is the
+first 16 hex digits of the SHA-256 of the round ID. A downloaded and a locally
+built BAI use the same key. Reference keys are shared across rounds on the
+same chromosome.
+
+| Input cache key | TTL |
+| --- | --- |
+| `output/scoring/round_<hash>/round.bam` | 2 hours |
+| `output/scoring/round_<hash>/round.bam.bai` | 2 hours |
+| `datasets/reference/<chrom>/<chrom>.fa` | 1 week |
+| `datasets/reference/<chrom>/<chrom>.fa.fai` | 1 week |
+| `datasets/reference/<chrom>/<chrom>.dict` | 1 week |
+
 The job uses namespace `SN107.0` and executor class `always_on.cpu.4c.8gb`.
 The caller timeout and assigned submit window bound the comparison. Without an
 assignment, the caller timeout applies. At submission, about 20% of the remaining

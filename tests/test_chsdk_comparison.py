@@ -208,7 +208,13 @@ def test_concurrent_index_retries_and_per_file_deletion(pair, caplog, monkeypatc
     assert len(state.specs) == 3
     keys = []
     for spec in state.specs:
-        assert len(spec.input_volumes) == 5
+        assert {mount: (vol.cache_key, vol.cache_ttl_seconds) for mount, vol in spec.input_volumes.items()} == {
+            "/volume/data/round.bam": (f"output/scoring/{safe_round_dir_name(ctx.round_id)}/round.bam", 7200),
+            "/volume/data/round.bam.bai": (f"output/scoring/{safe_round_dir_name(ctx.round_id)}/round.bam.bai", 7200),
+            "/volume/reference/chr20.fa": ("datasets/reference/chr20/chr20.fa", 604800),
+            "/volume/reference/chr20.fa.fai": ("datasets/reference/chr20/chr20.fa.fai", 604800),
+            "/volume/reference/chr20.dict": ("datasets/reference/chr20/chr20.dict", 604800),
+        }
         assert spec.input_volumes["/volume/data/round.bam.bai"].url.endswith(ctx.index_key)
         vcf_key, index_key = [vol.url.removeprefix("https://storage.test/") for vol in spec.output_volumes.values()]
         assert store.events.index(("delete", vcf_key)) < store.events.index(("get", index_key))
@@ -231,7 +237,10 @@ def test_downloaded_index_and_local_outcomes(pair, runtime, caplog):
     local = call().result(2)
     assert local.returncode == 0 and local.stdout == b"stdout\r\n"
     assert "result=mismatch" in caplog.text
-    assert state.specs[-1].input_volumes["/volume/data/round.bam.bai"].url == ctx.urls["round.bam.bai"]
+    index = state.specs[-1].input_volumes["/volume/data/round.bam.bai"]
+    assert index.url == ctx.urls["round.bam.bai"]
+    assert index.cache_key == f"output/scoring/{safe_round_dir_name(ctx.round_id)}/round.bam.bai"
+    assert index.cache_ttl_seconds == 7200
     assert not any(op == "upload" for op, _ in store.events)
     state.status = ComputeHordeJobStatus.REJECTED
     assert call().result(2).returncode == 0

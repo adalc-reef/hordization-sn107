@@ -25,6 +25,8 @@ from ._chsdk_storage import Store, StorageConfigurationError
 
 logger = logging.getLogger(__name__)
 _background = set()
+ROUND_CACHE_TTL_SECONDS = 2 * 60 * 60
+REFERENCE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def background(coro):
@@ -96,6 +98,10 @@ class ComparisonRound:
         self.region = region
         self.deadline = None if remaining is None else time.monotonic() + remaining
 
+    def round_volume(self, name, url):
+        path = self.bam.with_name(name).relative_to(self.base_dir)
+        return HTTPInputVolume(url=url, cache_key=path.as_posix(), cache_ttl_seconds=ROUND_CACHE_TTL_SECONDS)
+
     def inputs(self, spec):
         args = list(spec.args)
 
@@ -112,12 +118,14 @@ class ComparisonRound:
                 or host_path("-I") != self.bam or args[args.index("-L") + 1] != self.region):
             raise Unavailable("caller inputs differ from standard round inputs")
         refs = {Path(f["local"]): f["url"] for f in MINER_DATA_FILES}
-        sources = {}
+        volumes = {}
         for path in (expected, expected.with_suffix(".fa.fai"), expected.with_suffix(".dict")):
             local = self.base_dir / path
             if path not in refs or not local.is_file() or local.resolve() != local:
                 raise Unavailable("reference outside installer inventory or missing sidecar")
-            sources[f"/volume/reference/{path.name}"] = refs[path]
+            volumes[f"/volume/reference/{path.name}"] = HTTPInputVolume(
+                url=refs[path], cache_key=path.as_posix(), cache_ttl_seconds=REFERENCE_CACHE_TTL_SECONDS,
+            )
 
         for name in ("round.bam", "round.bam.bai"):
             if name.endswith(".bai") and self.built_index:
@@ -126,7 +134,7 @@ class ComparisonRound:
             scheme, host, *_ = resource(url or "")
             if scheme not in ("https", "http") or not host:
                 raise Unavailable("missing observed HTTP source for " + name)
-            sources[f"/volume/data/{name}"] = url
+            volumes[f"/volume/data/{name}"] = self.round_volume(name, url)
 
         output = host_path("-O")
         if output.parent != self.bam.parent or not re.fullmatch(r"miner_[a-zA-Z0-9_-]+\.vcf\.gz", output.name):
@@ -134,7 +142,7 @@ class ComparisonRound:
         for flag, path in (("-R", f"/volume/reference/{expected.name}"), ("-I", "/volume/data/round.bam"),
                            ("-O", f"/output/{output.name}")):
             args[args.index(flag) + 1] = path
-        return sources, args, output
+        return volumes, args, output
 
     async def storage(self):
         if self.store_task is None:
@@ -189,10 +197,11 @@ async def delete_keys(store, keys, delay=0):
 
 
 async def _execute(ctx, spec, deadline, remote_keys):
-    sources, args, output = ctx.inputs(spec)
+    volumes, args, output = ctx.inputs(spec)
     store = await ctx.storage()
     if ctx.built_index:
-        sources["/volume/data/round.bam.bai"] = await ctx.index_url(store, deadline)
+        url = await ctx.index_url(store, deadline)
+        volumes["/volume/data/round.bam.bai"] = ctx.round_volume("round.bam.bai", url)
     signing_key, target = await asyncio.to_thread(remote_keys)
     with _common._live_lock:
         if ctx.closed or ctx.generation != _common._open_round:
@@ -206,11 +215,10 @@ async def _execute(ctx, spec, deadline, remote_keys):
     download_budget = max(1, remaining // 5)
     upload_budget = max(1, remaining // 10)
     job_spec = ComputeHordeJobSpec(
-        # 0.0.20 exposes only the larger CPU class. 0.0.21 added 4c/8gb.
-        executor_class=getattr(ExecutorClass, "always_on__cpu__4c__8gb", ExecutorClass.always_on__cpu__8c__16gb),
+        executor_class=ExecutorClass.always_on__cpu__4c__8gb,
         job_namespace="SN107.0",
         docker_image=spec.docker_image, args=args, artifacts_dir="",
-        input_volumes={p: HTTPInputVolume(url=u) for p, u in sources.items()},
+        input_volumes=volumes,
         output_volumes={f"/output/{n}": HTTPOutputVolume(http_method="PUT", url=store.sign("put_object", k, deadline))
                         for n, k in files.items()},
         download_time_limit_sec=download_budget, execution_time_limit_sec=remaining - download_budget - upload_budget,
